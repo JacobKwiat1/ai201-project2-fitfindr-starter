@@ -120,27 +120,67 @@ For each tool, describe the specific failure mode you're handling and what the a
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    A["User Query (string)"] --> B["run_agent(query, wardrobe)"]
-    B --> C["Parse query\n(LLM or regex)\n→ description, size, max_price"]
-    C --> D["session['parsed']"]
-    D --> E["search_listings(description, size, max_price)\nload + filter + score listings"]
-    E --> F{Any results?}
-    F -- No --> G["session['error'] = helpful message\nreturn session early"]
-    F -- Yes --> H["session['search_results']\nselect top item → session['selected_item']"]
-    H --> I["suggest_outfit(selected_item, wardrobe)"]
-    I --> J{Wardrobe empty?}
-    J -- Yes --> K["LLM: general styling advice\nfor item type + tags"]
-    J -- No --> L["LLM: specific outfit combinations\nusing named wardrobe pieces"]
-    K --> M["session['outfit_suggestion']"]
-    L --> M
-    M --> N["create_fit_card(outfit_suggestion, selected_item)"]
-    N --> O["session['fit_card']"]
-    O --> P["return session"]
-    P --> Q["app.py reads session fields\n→ 3 Gradio output panels"]
-
-    style G fill:#ffcccc
+```
+User query + wardrobe
+        │
+        ▼
+  run_agent()
+  init session dict
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Planning Loop  (max 3 tool calls)                              │
+│                                                                 │
+│   messages = [system prompt, user query]                        │
+│        │                                                        │
+│        ▼                                                        │
+│   LLM (tool_choice="auto")  ◄── re-sent every iteration        │
+│        │                         with full tool schemas         │
+│        │                                                        │
+│        ├── no tool call ──────────────────────────────► break  │
+│        │                                                        │
+│        ▼  tool call(s) returned                                 │
+│                                                                 │
+│   ├─► search_listings(description, size, max_price)             │
+│   │        │                                                    │
+│   │        ├── results=[] ──► session["error"] set ──► break   │
+│   │        │                                                    │
+│   │        └── results=[...] ──► session["selected_item"]       │
+│   │                              = results[0]                   │
+│   │                                                             │
+│   ├─► suggest_outfit(item_title)                                │
+│   │        │  reads session["selected_item"]                    │
+│   │        │  (or builds _minimal_item if no search ran)        │
+│   │        │                                                    │
+│   │        ├── wardrobe empty ──► general styling advice        │
+│   │        └── wardrobe present ──► outfit using named pieces   │
+│   │                │                                            │
+│   │        session["outfit_suggestion"] = result                │
+│   │                                                             │
+│   └─► create_fit_card(item_title)                               │
+│            │  reads session["outfit_suggestion"]                │
+│            │  reads session["selected_item"]                    │
+│            │                                                    │
+│        session["fit_card"] = result ──────────────────► break  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+  Post-loop fill-in
+  (if selected_item exists and no error)
+        │
+        ├── outfit_suggestion missing? ──► call suggest_outfit directly
+        └── fit_card missing?          ──► call create_fit_card directly
+        │
+        ▼
+  return session
+        │
+        ▼
+  app.py
+  ├── session["error"]           ──► Panel 1 (error message), panels 2-3 blank
+  ├── session["selected_item"]   ──► Panel 1 (listing details)
+  ├── session["outfit_suggestion"] ► Panel 2 (outfit idea)
+  └── session["fit_card"]        ──► Panel 3 (OOTD caption)
 ```
 
 ---

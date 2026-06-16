@@ -18,7 +18,76 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
+import json
+import os
+
+from dotenv import load_dotenv
+from groq import Groq, BadRequestError
+
 from tools import search_listings, suggest_outfit, create_fit_card
+
+load_dotenv()
+
+_MODEL = "llama-3.3-70b-versatile"
+_MAX_TOOL_CALLS = 3
+
+# Tool definitions shown to the LLM. suggest_outfit and create_fit_card take no
+# LLM-supplied parameters — the agent passes state from the session automatically.
+_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_listings",
+            "description": "Search the secondhand clothing database for matching items.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string"},
+                    "size":        {"type": "string"},
+                    "max_price":   {"type": "number"},
+                },
+                "required": ["description"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "suggest_outfit",
+            "description": "Suggest outfit combinations for an item using the user's wardrobe.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_title": {"type": "string"},
+                },
+                "required": ["item_title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_fit_card",
+            "description": "Generate a short, shareable OOTD caption for a thrifted item and outfit.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_title": {"type": "string"},
+                },
+                "required": ["item_title"],
+            },
+        },
+    },
+]
+
+
+# ── Groq client ───────────────────────────────────────────────────────────────
+
+def _get_groq_client():
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise ValueError("GROQ_API_KEY not set. Add it to a .env file in the project root.")
+    return Groq(api_key=api_key)
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -45,12 +114,78 @@ def _new_session(query: str, wardrobe: dict) -> dict:
     }
 
 
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _minimal_item(args: dict) -> dict:
+    """Build a bare-minimum item dict from LLM-supplied args when no search ran."""
+    return {
+        "title": args.get("item_title", "Item"),
+        "description": args.get("item_description", ""),
+        "price": 0.0,
+        "platform": "unknown",
+        "category": "clothing",
+        "style_tags": [],
+        "size": "unknown",
+        "condition": "unknown",
+        "brand": None,
+    }
+
+
+# ── tool dispatcher ───────────────────────────────────────────────────────────
+
+def _execute_tool(name: str, args: dict, session: dict) -> str:
+    """
+    Execute a single tool call, update session state, and return a result
+    string the LLM can read in the next turn.
+    """
+    if name == "search_listings":
+        session["parsed"] = args
+        results = search_listings(
+            description=args["description"],
+            size=args.get("size"),
+            max_price=args.get("max_price"),
+        )
+        session["search_results"] = results
+        if not results:
+            session["error"] = (
+                "No listings found matching your search — "
+                "try a broader description or raise your price limit."
+            )
+            return "No listings found matching those criteria."
+        session["selected_item"] = results[0]
+        top = results[0]
+        return f"Found {len(results)} item(s). Top: {top['title']} — ${top['price']}, size {top['size']}."
+
+    if name == "suggest_outfit":
+        if not session.get("selected_item"):
+            session["selected_item"] = _minimal_item(args)
+        suggestion = suggest_outfit(session["selected_item"], session["wardrobe"])
+        session["outfit_suggestion"] = suggestion
+        return "Outfit suggestion ready."
+
+    if name == "create_fit_card":
+        outfit = session.get("outfit_suggestion") or args.get("outfit", "")
+        if not outfit:
+            return "Error: no outfit available. Call suggest_outfit first."
+        if not session.get("selected_item"):
+            session["selected_item"] = _minimal_item(args)
+        card = create_fit_card(outfit, session["selected_item"])
+        session["fit_card"] = card
+        return "Fit card ready."
+
+    return f"Unknown tool: {name}"
+
+
 # ── planning loop ─────────────────────────────────────────────────────────────
 
 def run_agent(query: str, wardrobe: dict) -> dict:
     """
     Main agent entry point. Runs the FitFindr planning loop for a single
     user interaction and returns the completed session dict.
+
+    The LLM drives the loop: each turn it decides whether to call a tool or
+    return a final answer. The loop stops when the LLM makes no tool call or
+    when the _MAX_TOOL_CALLS limit is reached.
 
     Args:
         query:    Natural language user request
@@ -62,39 +197,102 @@ def run_agent(query: str, wardrobe: dict) -> dict:
         The session dict after the interaction completes. Check session["error"]
         first — if it is not None, the interaction ended early and the other
         output fields (outfit_suggestion, fit_card) will be None.
-
-    TODO — implement this function using the planning loop you designed in planning.md:
-
-        Step 1: Initialize the session with _new_session().
-
-        Step 2: Parse the user's query to extract a description, size, and
-                max_price. You can use regex, string splitting, or ask the LLM
-                to parse it — document your choice in planning.md.
-                Store the result in session["parsed"].
-
-        Step 3: Call search_listings() with the parsed parameters.
-                Store results in session["search_results"].
-                If no results: set session["error"] to a helpful message and
-                return the session early. Do NOT proceed to suggest_outfit
-                with empty input.
-
-        Step 4: Select the item to use (e.g., the top result).
-                Store it in session["selected_item"].
-
-        Step 5: Call suggest_outfit() with the selected item and wardrobe.
-                Store the result in session["outfit_suggestion"].
-
-        Step 6: Call create_fit_card() with the outfit suggestion and selected item.
-                Store the result in session["fit_card"].
-
-        Step 7: Return the session.
-
-    Before writing code, complete the Planning Loop and State Management sections
-    of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+    client = _get_groq_client()
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are FitFindr, a secondhand fashion assistant. "
+                "Use the available tools to help the user. "
+                "Call search_listings to find items for sale; "
+                "skip it only if the user is describing items they already own. "
+                "Stop calling tools once you have produced what the user asked for."
+            ),
+        },
+        {"role": "user", "content": query},
+    ]
+
+    tool_call_count = 0
+
+    while tool_call_count < _MAX_TOOL_CALLS:
+        try:
+            response = client.chat.completions.create(
+                model=_MODEL,
+                messages=messages,
+                tools=_TOOLS,
+                tool_choice="auto",
+                max_tokens=512,
+            )
+        except BadRequestError:
+            # Model generated a malformed tool call — retry without tools
+            response = client.chat.completions.create(
+                model=_MODEL,
+                messages=messages,
+                max_tokens=512,
+            )
+
+        message = response.choices[0].message
+
+        # Record the assistant turn in history (include tool_calls if present)
+        assistant_turn = {"role": "assistant", "content": message.content or ""}
+        if message.tool_calls:
+            assistant_turn["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in message.tool_calls
+            ]
+        messages.append(assistant_turn)
+
+        # No tool calls → LLM is done
+        if not message.tool_calls:
+            break
+
+        # Execute each tool and feed results back into the conversation
+        for tc in message.tool_calls:
+            tool_call_count += 1
+            raw_args = tc.function.arguments
+            args = json.loads(raw_args) if raw_args else {}
+            if not isinstance(args, dict):
+                args = {}
+            result = _execute_tool(tc.function.name, args, session)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result,
+            })
+
+        # Stop as soon as the final output is ready or a terminal error occurred
+        if session["fit_card"] or session["error"]:
+            break
+
+    else:
+        # while condition exhausted — hit the tool call limit
+        session["error"] = (
+            f"Reached the maximum of {_MAX_TOOL_CALLS} tool calls. "
+            "The response may be incomplete."
+        )
+
+    # If a search found an item but the LLM stopped before completing the pipeline,
+    # fill the gaps directly so app.py always has all three panels populated.
+    # if session["selected_item"] and not session["error"]:
+    #     if not session["outfit_suggestion"]:
+    #         session["outfit_suggestion"] = suggest_outfit(
+    #             session["selected_item"], wardrobe
+    #         )
+    #     if not session["fit_card"]:
+    #         session["fit_card"] = create_fit_card(
+    #             session["outfit_suggestion"], session["selected_item"]
+    #         )
+
     return session
 
 
