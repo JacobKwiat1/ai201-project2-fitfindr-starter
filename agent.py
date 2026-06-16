@@ -29,7 +29,7 @@ from tools import search_listings, suggest_outfit, create_fit_card
 load_dotenv()
 
 _MODEL = "llama-3.3-70b-versatile"
-_MAX_TOOL_CALLS = 3
+_MAX_TOOL_CALLS = 5
 
 # Tool definitions shown to the LLM. suggest_outfit and create_fit_card take no
 # LLM-supplied parameters — the agent passes state from the session automatically.
@@ -209,7 +209,10 @@ def run_agent(query: str, wardrobe: dict) -> dict:
                 "Use the available tools to help the user. "
                 "Call search_listings to find items for sale; "
                 "skip it only if the user is describing items they already own. "
-                "Stop calling tools once you have produced what the user asked for."
+                "For a general item search with no specific output requested, call all three tools in order. "
+                "For a specific request (outfit idea only, fit card only, etc.), call only the tools needed. "
+                "Stop calling tools once you have produced what the user asked for. "
+                "Call tools immediately without any preamble text."
             ),
         },
         {"role": "user", "content": query},
@@ -281,17 +284,9 @@ def run_agent(query: str, wardrobe: dict) -> dict:
             "The response may be incomplete."
         )
 
-    # If a search found an item but the LLM stopped before completing the pipeline,
-    # fill the gaps directly so app.py always has all three panels populated.
-    # if session["selected_item"] and not session["error"]:
-    #     if not session["outfit_suggestion"]:
-    #         session["outfit_suggestion"] = suggest_outfit(
-    #             session["selected_item"], wardrobe
-    #         )
-    #     if not session["fit_card"]:
-    #         session["fit_card"] = create_fit_card(
-    #             session["outfit_suggestion"], session["selected_item"]
-    #         )
+    # Guard against a text-only response that left the session entirely empty.
+    if not session["selected_item"] and not session["error"]:
+        session["error"] = "Something went wrong. Please try your query again."
 
     return session
 
